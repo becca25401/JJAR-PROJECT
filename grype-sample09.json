@@ -1,0 +1,34 @@
+{
+  "source": {
+    "target": {
+      "userInput": "batch:0.9.0",
+      "name": "batch"
+    }
+  },
+  "matches": [
+    {
+      "vulnerability": {
+        "id": "CVE-2020-33333",
+        "severity": "Critical",
+        "fix": { "versions": ["2.1.0"] }
+      },
+      "artifact": {
+        "name": "nginx",
+        "version": "1.18.0",
+        "type": "library"
+      }
+    },
+    {
+      "vulnerability": {
+        "id": "CVE-2017-99999",
+        "severity": "Unknown",
+        "fix": { "versions": [] }
+      },
+      "artifact": {
+        "name": "unknown-lib",
+        "version": "0.0.1",
+        "type": "library"
+      }
+    }
+  ]
+}

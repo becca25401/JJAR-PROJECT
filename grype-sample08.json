@@ -1,0 +1,34 @@
+{
+  "source": {
+    "target": {
+      "userInput": "db-migrator:1.0.0",
+      "name": "db-migrator"
+    }
+  },
+  "matches": [
+    {
+      "vulnerability": {
+        "id": "CVE-2021-88888",
+        "severity": "High",
+        "fix": { "versions": ["13.4"] }
+      },
+      "artifact": {
+        "name": "postgresql-client",
+        "version": "13.2",
+        "type": "library"
+      }
+    },
+    {
+      "vulnerability": {
+        "id": "CVE-2022-11111",
+        "severity": "Medium",
+        "fix": { "versions": [] }
+      },
+      "artifact": {
+        "name": "curl",
+        "version": "7.68.0",
+        "type": "library"
+      }
+    }
+  ]
+}

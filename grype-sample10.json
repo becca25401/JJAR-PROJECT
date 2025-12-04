@@ -1,0 +1,34 @@
+{
+  "source": {
+    "target": {
+      "userInput": "utils:1.0.0",
+      "name": "utils"
+    }
+  },
+  "matches": [
+    {
+      "vulnerability": {
+        "id": "CVE-2019-55555",
+        "severity": "Low",
+        "fix": { "versions": ["5.1"] }
+      },
+      "artifact": {
+        "name": "bash",
+        "version": "5.0",
+        "type": "library"
+      }
+    },
+    {
+      "vulnerability": {
+        "id": "CVE-2018-77777",
+        "severity": "Negligible",
+        "fix": { "versions": [] }
+      },
+      "artifact": {
+        "name": "busybox",
+        "version": "1.31.1",
+        "type": "library"
+      }
+    }
+  ]
+}
