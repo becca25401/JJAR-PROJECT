@@ -1,0 +1,551 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>Grype Scan Viewer</title>
+  <style>
+    body { font-family: sans-serif; margin: 20px; }
+    .summary { display: flex; gap: 1rem; margin-top: 1rem; flex-wrap: wrap; }
+    .card { padding: 1rem; border: 1px solid #ccc; border-radius: 8px; min-width: 150px; }
+    table { border-collapse: collapse; width: 100%; margin-top: 1rem; font-size: 0.9rem; }
+    th, td { border: 1px solid #ddd; padding: 0.5rem; vertical-align: top; }
+    th { cursor: default; background: #f5f5f5; }
+    #filters { margin-top: 1rem; display: flex; gap: 1rem; flex-wrap: wrap; }
+    label { font-size: 0.9rem; }
+    #actions { margin-top: 1rem; display: flex; gap: 0.75rem; align-items: center; flex-wrap: wrap; }
+    button { padding: 0.4rem 0.8rem; font-size: 0.9rem; cursor: pointer; }
+  </style>
+</head>
+<body>
+
+<h1>Grype Scan Viewer</h1>
+
+<!-- Allow multiple JSON files -->
+<input type="file" id="fileInput" accept=".json" multiple>
+<div id="status"></div>
+<div id="lastUpload" style="margin-top: 5px; font-size: 0.9rem; color: #555;"></div>
+
+<div class="summary" id="summary"></div>
+
+<div id="filters">
+  <label>
+    Severity:
+    <select id="severityFilter">
+      <option value="">(All)</option>
+      <option>Critical</option>
+      <option>High</option>
+      <option>Medium</option>
+      <option>Low</option>
+      <option>Negligible</option>
+      <option>Unknown</option>
+    </select>
+  </label>
+
+  <label>
+    Image contains:
+    <input type="text" id="imageFilter" placeholder="e.g. orchestrator">
+  </label>
+
+  <label>
+    Fix available:
+    <select id="fixFilter">
+      <option value="">(All)</option>
+      <option value="yes">Yes</option>
+      <option value="no">No</option>
+    </select>
+  </label>
+
+  <label>
+    Status:
+    <select id="statusFilter">
+      <option value="">(All)</option>
+      <option value="open">Open</option>
+      <option value="fixed">Fixed</option>
+    </select>
+  </label>
+</div>
+
+<div id="actions">
+  <button id="exportBtn" disabled>Export to Excel (CSV)</button>
+
+  <button id="exportStatusBtn">Export Status (JSON)</button>
+
+  <label style="font-size: 0.9rem;">
+    Import Status:
+    <input type="file" id="importStatusInput" accept=".json" style="font-size: 0.9rem;">
+  </label>
+</div>
+
+<table id="resultsTable">
+  <thead>
+    <tr>
+      <th>Vuln ID</th>
+      <th>Severity</th>
+      <th>Package</th>
+      <th>Installed Version</th>
+      <th>Fix Version</th>
+      <th>Type</th>
+      <th>Images Count</th>
+      <th>Images</th>
+      <th>Status</th>
+    </tr>
+  </thead>
+  <tbody></tbody>
+</table>
+
+<script>
+let allFindings = [];      // raw, per-match (across all files)
+let groupedFindings = [];  // grouped by CVE/package/version/etc.
+let currentFiltered = [];  // currently displayed grouped rows
+let lastUploadTimestamp = null;
+
+// Persisted "fixed"/"open" state per grouped finding, from localStorage
+let fixedStatus = JSON.parse(localStorage.getItem('grypeFixedStatus') || '{}');
+
+// Restore last upload timestamp if present
+const savedTs = localStorage.getItem('grypeLastUpload');
+if (savedTs) {
+  document.getElementById('lastUpload').textContent = `Last Upload: ${savedTs}`;
+}
+
+// ---------- Utility: persist fixedStatus ----------
+function saveFixedStatus() {
+  localStorage.setItem('grypeFixedStatus', JSON.stringify(fixedStatus || {}));
+}
+
+// ---------- Utility: format & show last upload time ----------
+function updateLastUploadTimestamp() {
+  const now = new Date();
+  lastUploadTimestamp = now;
+
+  const formatted =
+    now.getFullYear() + '-' +
+    String(now.getMonth() + 1).padStart(2, '0') + '-' +
+    String(now.getDate()).padStart(2, '0') + ' ' +
+    String(now.getHours()).padStart(2, '0') + ':' +
+    String(now.getMinutes()).padStart(2, '0') + ':' +
+    String(now.getSeconds()).padStart(2, '0');
+
+  document.getElementById('lastUpload').textContent =
+    `Last Upload: ${formatted}`;
+
+  localStorage.setItem('grypeLastUpload', formatted);
+}
+
+// ---------- File upload: handle multi-file selection ----------
+document.getElementById('fileInput').addEventListener('change', (e) => {
+  const files = Array.from(e.target.files || []);
+  if (!files.length) return;
+
+  const statusEl = document.getElementById('status');
+  statusEl.textContent = `Reading ${files.length} file(s)...`;
+
+  const readers = files.map(file => {
+    return new Promise((resolve) => {
+      const reader = new FileReader();
+      reader.onload = (evt) => {
+        try {
+          const data = JSON.parse(evt.target.result);
+          resolve({ data, fileName: file.name });
+        } catch (err) {
+          console.error(`Error parsing JSON in file ${file.name}:`, err);
+          resolve(null); // skip invalid file
+        }
+      };
+      reader.onerror = () => {
+        console.error(`Error reading file ${file.name}`);
+        resolve(null);
+      };
+      reader.readAsText(file);
+    });
+  });
+
+  Promise.all(readers).then(results => {
+    const validDocs = results.filter(r =>
+      r &&
+      r.data &&
+      r.data.matches &&
+      Array.isArray(r.data.matches)
+    );
+
+    if (!validDocs.length) {
+      statusEl.textContent = 'No valid Grype JSON files found (no matches[]).';
+      allFindings = [];
+      groupedFindings = [];
+      renderSummary();
+      renderTable();
+      document.getElementById('exportBtn').disabled = true;
+      return;
+    }
+
+    processGrypeDocuments(validDocs, files.length);
+    updateLastUploadTimestamp();
+  });
+});
+
+// ---------- Process array of { data, fileName } from multiple files ----------
+function processGrypeDocuments(docs, fileCount) {
+  allFindings = [];
+
+  docs.forEach(({ data, fileName }) => {
+    const sourceObj = data.source;
+
+    // Try to resolve a meaningful "image" label from source
+    let sourceUserInput = '';
+    let sourceName = '';
+
+    if (sourceObj && typeof sourceObj === 'object') {
+      if (sourceObj.target && typeof sourceObj.target === 'object') {
+        sourceUserInput = sourceObj.target.userInput || '';
+        sourceName = sourceObj.target.name || '';
+      }
+      if (!sourceName && sourceObj.name) {
+        sourceName = sourceObj.name;
+      }
+    } else if (typeof sourceObj === 'string') {
+      sourceName = sourceObj;
+    }
+
+    data.matches.forEach(m => {
+      const artifact = m.artifact || {};
+      const vuln = m.vulnerability || {};
+
+      const imageName =
+        sourceUserInput ||
+        sourceName ||
+        artifact.location ||
+        fileName ||
+        'unknown';
+
+      allFindings.push({
+        image: imageName,
+        vulnId: vuln.id || '',
+        severity: vuln.severity || 'Unknown',
+        package: artifact.name || '',
+        installedVersion: artifact.version || '',
+        fixVersion: (vuln.fix && vuln.fix.versions && vuln.fix.versions[0]) || '',
+        type: artifact.type || ''
+      });
+    });
+  });
+
+  groupedFindings = groupFindings(allFindings);
+
+  document.getElementById('status').textContent =
+    `Loaded ${docs.length} valid file(s), ${allFindings.length} findings, ` +
+    `${groupedFindings.length} unique CVE/package entries.`;
+
+  renderSummary();
+  renderTable();
+  document.getElementById('exportBtn').disabled = groupedFindings.length === 0;
+}
+
+// ---------- Group findings by vulnId+package+version+fix+severity+type ----------
+function groupFindings(findings) {
+  const map = new Map();
+
+  findings.forEach(f => {
+    const key = [
+      f.vulnId,
+      f.package,
+      f.installedVersion,
+      f.fixVersion,
+      f.severity,
+      f.type
+    ].join('|');
+
+    let entry = map.get(key);
+    if (!entry) {
+      entry = {
+        key,  // stable identifier for this grouped finding
+        vulnId: f.vulnId,
+        severity: f.severity,
+        package: f.package,
+        installedVersion: f.installedVersion,
+        fixVersion: f.fixVersion,
+        type: f.type,
+        images: new Set()
+      };
+      map.set(key, entry);
+    }
+    if (f.image) {
+      entry.images.add(f.image);
+    }
+  });
+
+  return Array.from(map.values()).map(e => ({
+    ...e,
+    images: Array.from(e.images).sort()
+  }));
+}
+
+// ---------- Summary cards ----------
+function renderSummary() {
+  const summaryEl = document.getElementById('summary');
+  summaryEl.innerHTML = '';
+
+  const totalRaw = allFindings.length;
+  const totalGrouped = groupedFindings.length;
+
+  const bySeverity = {};
+  const images = new Set();
+
+  let openCount = 0;
+  let fixedCount = 0;
+
+  allFindings.forEach(f => {
+    const sev = f.severity || 'Unknown';
+    bySeverity[sev] = (bySeverity[sev] || 0) + 1;
+    if (f.image) images.add(f.image);
+  });
+
+  groupedFindings.forEach(g => {
+    const status = fixedStatus[g.key] || 'open';
+    if (status === 'fixed') fixedCount++;
+    else openCount++;
+  });
+
+  summaryEl.appendChild(makeCard('Total Findings (raw)', totalRaw));
+  summaryEl.appendChild(makeCard('Unique CVE/Package entries', totalGrouped));
+  summaryEl.appendChild(makeCard('Unique Images', images.size));
+  summaryEl.appendChild(makeCard('Open (grouped)', openCount));
+  summaryEl.appendChild(makeCard('Fixed (grouped)', fixedCount));
+
+  Object.keys(bySeverity).sort().forEach(sev => {
+    summaryEl.appendChild(makeCard(sev, bySeverity[sev]));
+  });
+}
+
+function makeCard(title, value) {
+  const div = document.createElement('div');
+  div.className = 'card';
+  div.innerHTML = `<strong>${title}</strong><br>${value}`;
+  return div;
+}
+
+// ---------- Table render (filtered, grouped) ----------
+function renderTable() {
+  const tbody = document.querySelector('#resultsTable tbody');
+  tbody.innerHTML = '';
+
+  const severityFilter = document.getElementById('severityFilter').value;
+  const imageFilter = document.getElementById('imageFilter').value.toLowerCase();
+  const fixFilter = document.getElementById('fixFilter').value;
+  const statusFilter = document.getElementById('statusFilter').value; // open/fixed/(All)
+
+  const filtered = groupedFindings.filter(g => {
+    if (severityFilter && g.severity !== severityFilter) return false;
+
+    if (imageFilter) {
+      const matchesImage = g.images.some(img =>
+        img.toLowerCase().includes(imageFilter)
+      );
+      if (!matchesImage) return false;
+    }
+
+    const hasFix = !!g.fixVersion;
+    if (fixFilter === 'yes' && !hasFix) return false;
+    if (fixFilter === 'no' && hasFix) return false;
+
+    const status = fixedStatus[g.key] || 'open';
+    if (statusFilter && status !== statusFilter) return false;
+
+    return true;
+  });
+
+  currentFiltered = filtered;
+
+  filtered.forEach(g => {
+    const imagesText = g.images.join(', ');
+    const imagesCount = g.images.length;
+
+    const status = fixedStatus[g.key] || 'open';
+    const checkedAttr = status === 'fixed' ? 'checked' : '';
+    const statusLabel = status === 'fixed' ? 'Fixed' : 'Open';
+
+    const tr = document.createElement('tr');
+    tr.innerHTML = `
+      <td>${escapeHtml(g.vulnId)}</td>
+      <td>${escapeHtml(g.severity)}</td>
+      <td>${escapeHtml(g.package)}</td>
+      <td>${escapeHtml(g.installedVersion)}</td>
+      <td>${escapeHtml(g.fixVersion)}</td>
+      <td>${escapeHtml(g.type)}</td>
+      <td title="${escapeHtml(imagesText)}">${imagesCount}</td>
+      <td title="${escapeHtml(imagesText)}">${escapeHtml(imagesText)}</td>
+      <td>
+        <label>
+          <input type="checkbox"
+                 class="status-checkbox"
+                 data-key="${escapeHtml(g.key)}"
+                 ${checkedAttr}>
+          <span>${statusLabel}</span>
+        </label>
+      </td>
+    `;
+    tbody.appendChild(tr);
+  });
+}
+
+function escapeHtml(str) {
+  return String(str || '')
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;');
+}
+
+// ---------- CSV helpers ----------
+function csvEscape(value) {
+  const v = String(value ?? '');
+  return `"${v.replace(/"/g, '""')}"`;
+}
+
+function exportToCsv() {
+  if (!currentFiltered || currentFiltered.length === 0) {
+    alert('No rows to export.');
+    return;
+  }
+
+  const header = [
+    'Vuln ID',
+    'Severity',
+    'Package',
+    'Installed Version',
+    'Fix Version',
+    'Type',
+    'Images Count',
+    'Images',
+    'Status'
+  ];
+
+  const lines = [header.map(csvEscape).join(',')];
+
+  currentFiltered.forEach(g => {
+    const imagesText = g.images.join('; ');
+    const imagesCount = g.images.length;
+    const status = fixedStatus[g.key] || 'open';
+
+    const row = [
+      g.vulnId,
+      g.severity,
+      g.package,
+      g.installedVersion,
+      g.fixVersion,
+      g.type,
+      imagesCount,
+      imagesText,
+      status
+    ].map(csvEscape);
+
+    lines.push(row.join(','));
+  });
+
+  const csvContent = lines.join('\r\n');
+  const blob = new Blob([csvContent], { type: 'text/csv;charset=utf-8;' });
+
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement('a');
+  link.href = url;
+
+  const now = new Date();
+  const ts = now.toISOString().replace(/[:T]/g, '-').split('.')[0];
+  link.download = `grype-report-${ts}.csv`;
+
+  document.body.appendChild(link);
+  link.click();
+  document.body.removeChild(link);
+  URL.revokeObjectURL(url);
+}
+
+// ---------- Status export/import (JSON) ----------
+function exportStatusToFile() {
+  const data = JSON.stringify(fixedStatus || {}, null, 2);
+  const blob = new Blob([data], { type: 'application/json;charset=utf-8;' });
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement('a');
+  const now = new Date();
+  const ts = now.toISOString().replace(/[:T]/g, '-').split('.')[0];
+
+  link.href = url;
+  link.download = `grype-status-${ts}.json`;
+
+  document.body.appendChild(link);
+  link.click();
+  document.body.removeChild(link);
+  URL.revokeObjectURL(url);
+}
+
+function importStatusFromFile(file) {
+  const reader = new FileReader();
+  reader.onload = (evt) => {
+    try {
+      const imported = JSON.parse(evt.target.result || '{}');
+
+      if (typeof imported !== 'object' || imported === null) {
+        alert('Imported file is not a valid status JSON object.');
+        return;
+      }
+
+      // Merge imported statuses into existing map
+      fixedStatus = {
+        ...(fixedStatus || {}),
+        ...imported
+      };
+
+      saveFixedStatus();
+
+      // Refresh UI to reflect new statuses
+      renderSummary();
+      renderTable();
+      alert('Status import complete.');
+    } catch (err) {
+      console.error('Error parsing status JSON', err);
+      alert('Failed to parse status JSON file.');
+    }
+  };
+  reader.readAsText(file);
+}
+
+// ---------- Event wiring ----------
+
+// Filters
+['severityFilter', 'imageFilter', 'fixFilter', 'statusFilter'].forEach(id => {
+  document.getElementById(id).addEventListener('input', renderTable);
+});
+
+// Status checkbox changes
+document.querySelector('#resultsTable tbody').addEventListener('change', (e) => {
+  if (!e.target.classList.contains('status-checkbox')) return;
+
+  const key = e.target.dataset.key;
+  const isFixed = e.target.checked;
+  const newStatus = isFixed ? 'fixed' : 'open';
+
+  fixedStatus[key] = newStatus;
+  saveFixedStatus();
+
+  const span = e.target.nextElementSibling;
+  if (span) {
+    span.textContent = isFixed ? 'Fixed' : 'Open';
+  }
+
+  renderSummary();
+  renderTable();
+});
+
+// Export CSV
+document.getElementById('exportBtn').addEventListener('click', exportToCsv);
+
+// Export Status JSON
+document.getElementById('exportStatusBtn').addEventListener('click', exportStatusToFile);
+
+// Import Status JSON
+document.getElementById('importStatusInput').addEventListener('change', (e) => {
+  const file = e.target.files && e.target.files[0];
+  if (!file) return;
+  importStatusFromFile(file);
+  e.target.value = '';
+});
+</script>
+</body>
+</html>
