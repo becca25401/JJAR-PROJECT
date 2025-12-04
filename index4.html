@@ -1,0 +1,475 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>Grype Scan Viewer</title>
+  <style>
+    body { font-family: sans-serif; margin: 20px; }
+
+    /* SUMMARY CARDS ROW */
+    .summary {
+      display: flex;
+      gap: 0.5rem;
+      margin-top: 1rem;
+      flex-wrap: nowrap;
+      overflow-x: auto;
+      padding-bottom: 0.5rem;
+    }
+
+    .card {
+      padding: 0.4rem 0.6rem;
+      border: 1px solid #ccc;
+      border-radius: 5px;
+      min-width: 110px;
+      text-align: center;
+      font-size: 0.8rem;
+      white-space: nowrap;
+      background: #f7f7f7;
+    }
+
+    /* Severity color overrides */
+    .sev-critical { background: #d9534f; color: white; }
+    .sev-high     { background: #f0ad4e; color: black; }
+    .sev-medium   { background: #ffd500; color: black; }
+    .sev-low      { background: #5bc0de; color: black; }
+
+    table { border-collapse: collapse; width: 100%; margin-top: 1rem; font-size: 0.9rem; }
+    th, td { border: 1px solid #ddd; padding: 0.5rem; vertical-align: top; }
+    th { background: #f5f5f5; }
+    #filters { margin-top: 1rem; display: flex; gap: 1rem; flex-wrap: wrap; }
+    label { font-size: 0.9rem; }
+    #actions { margin-top: 1rem; display: flex; gap: 0.75rem; align-items: center; flex-wrap: wrap; }
+    button { padding: 0.4rem 0.8rem; font-size: 0.9rem; cursor: pointer; }
+
+    /* Comments box */
+    .comment-box {
+      width: 180px;
+      height: 50px;
+      font-size: 0.85rem;
+    }
+  </style>
+</head>
+<body>
+
+<h1>Grype Scan Viewer</h1>
+
+<input type="file" id="fileInput" accept=".json" multiple>
+<div id="status"></div>
+<div id="lastUpload" style="margin-top: 5px; font-size: 0.9rem; color: #555;"></div>
+
+<div class="summary" id="summary"></div>
+
+<div id="filters">
+  <label>
+    Severity:
+    <select id="severityFilter">
+      <option value="">(All)</option>
+      <option>Critical</option>
+      <option>High</option>
+      <option>Medium</option>
+      <option>Low</option>
+    </select>
+  </label>
+
+  <label>
+    Image contains:
+    <input type="text" id="imageFilter" placeholder="e.g. orchestrator">
+  </label>
+
+  <label>
+    Fix available:
+    <select id="fixFilter">
+      <option value="">(All)</option>
+      <option value="yes">Yes</option>
+      <option value="no">No</option>
+    </select>
+  </label>
+
+  <label>
+    Status:
+    <select id="statusFilter">
+      <option value="">(All)</option>
+      <option value="open">Open</option>
+      <option value="fixed">Fixed</option>
+    </select>
+  </label>
+</div>
+
+<div id="actions">
+  <button id="exportBtn" disabled>Export to Excel (CSV)</button>
+  <button id="exportStatusBtn">Export Status (JSON)</button>
+
+  <label style="font-size: 0.9rem;">
+    Import Status:
+    <input type="file" id="importStatusInput" accept=".json" style="font-size: 0.9rem;">
+  </label>
+</div>
+
+<table id="resultsTable">
+  <thead>
+    <tr>
+      <th>Vuln ID</th>
+      <th>Severity</th>
+      <th>Package</th>
+      <th>Installed Version</th>
+      <th>Fix Version</th>
+      <th>Type</th>
+      <th>Images Count</th>
+      <th>Images</th>
+      <th>Status</th>
+      <th>Comments</th>
+    </tr>
+  </thead>
+  <tbody></tbody>
+</table>
+
+<script>
+let allFindings = [];
+let groupedFindings = [];
+let currentFiltered = [];
+let lastUploadTimestamp = null;
+
+let fixedStatus = JSON.parse(localStorage.getItem('grypeFixedStatus') || '{}');
+let comments = JSON.parse(localStorage.getItem('grypeComments') || '{}');
+
+function saveFixedStatus() {
+  localStorage.setItem('grypeFixedStatus', JSON.stringify(fixedStatus || {}));
+}
+function saveComments() {
+  localStorage.setItem('grypeComments', JSON.stringify(comments || {}));
+}
+
+/* ---------- Last upload timestamp ---------- */
+const savedTs = localStorage.getItem('grypeLastUpload');
+if (savedTs) {
+  document.getElementById('lastUpload').textContent = `Last Upload: ${savedTs}`;
+}
+
+function updateLastUploadTimestamp() {
+  const now = new Date();
+  const formatted =
+    now.getFullYear() + '-' +
+    String(now.getMonth()+1).padStart(2,'0') + '-' +
+    String(now.getDate()).padStart(2,'0') + ' ' +
+    String(now.getHours()).padStart(2,'0') + ':' +
+    String(now.getMinutes()).padStart(2,'0') + ':' +
+    String(now.getSeconds()).padStart(2,'0');
+
+  document.getElementById('lastUpload').textContent = `Last Upload: ${formatted}`;
+  localStorage.setItem('grypeLastUpload', formatted);
+}
+
+/* ---------- File Upload & Parsing ---------- */
+document.getElementById('fileInput').addEventListener('change', e => {
+  const files = [...e.target.files];
+  if (files.length === 0) return;
+
+  document.getElementById('status').textContent = `Reading ${files.length} files...`;
+
+  const promises = files.map(file => new Promise(resolve => {
+    const reader = new FileReader();
+    reader.onload = evt => {
+      try {
+        resolve({ data: JSON.parse(evt.target.result), fileName: file.name });
+      } catch {
+        resolve(null);
+      }
+    };
+    reader.readAsText(file);
+  }));
+
+  Promise.all(promises).then(results => {
+    const valid = results.filter(r => r && r.data && Array.isArray(r.data.matches));
+    if (!valid.length) {
+      document.getElementById('status').textContent = "No valid Grype JSON found.";
+      return;
+    }
+
+    processGrypeDocuments(valid);
+    updateLastUploadTimestamp();
+  });
+});
+
+/* ---------- Process Parsed Data ---------- */
+function processGrypeDocuments(docs) {
+  allFindings = [];
+
+  docs.forEach(({ data, fileName }) => {
+    const image =
+      data.source?.target?.userInput ||
+      data.source?.target?.name ||
+      data.source?.name ||
+      fileName;
+
+    data.matches.forEach(m => {
+      allFindings.push({
+        image,
+        vulnId: m.vulnerability?.id || "",
+        severity: m.vulnerability?.severity || "Unknown",
+        package: m.artifact?.name || "",
+        installedVersion: m.artifact?.version || "",
+        fixVersion: m.vulnerability?.fix?.versions?.[0] || "",
+        type: m.artifact?.type || ""
+      });
+    });
+  });
+
+  groupedFindings = groupFindings(allFindings);
+
+  document.getElementById('status').textContent =
+    `Loaded ${docs.length} files, ${allFindings.length} findings, ${groupedFindings.length} unique entries.`;
+
+  renderSummary();
+  renderTable();
+  document.getElementById('exportBtn').disabled = groupedFindings.length === 0;
+}
+
+/* ---------- Group Findings ---------- */
+function groupFindings(findings) {
+  const map = new Map();
+
+  findings.forEach(f => {
+    const key = [
+      f.vulnId, f.package, f.installedVersion,
+      f.fixVersion, f.severity, f.type
+    ].join('|');
+
+    if (!map.has(key)) {
+      map.set(key, {
+        key,
+        vulnId: f.vulnId,
+        severity: f.severity,
+        package: f.package,
+        installedVersion: f.installedVersion,
+        fixVersion: f.fixVersion,
+        type: f.type,
+        images: new Set()
+      });
+    }
+    map.get(key).images.add(f.image);
+  });
+
+  return [...map.values()].map(e => ({
+    ...e,
+    images: [...e.images].sort()
+  }));
+}
+
+/* ---------- Summary Cards ---------- */
+function renderSummary() {
+  const div = document.getElementById('summary');
+  div.innerHTML = "";
+
+  const bySeverity = {};
+  const images = new Set();
+
+  allFindings.forEach(f => {
+    bySeverity[f.severity] = (bySeverity[f.severity] || 0) + 1;
+    images.add(f.image);
+  });
+
+  let open = 0, fixed = 0;
+  groupedFindings.forEach(g => {
+    if ((fixedStatus[g.key] || "open") === "fixed") fixed++;
+    else open++;
+  });
+
+  div.appendChild(makeCard("Total Findings", allFindings.length));
+  div.appendChild(makeCard("Unique CVEs", groupedFindings.length));
+  div.appendChild(makeCard("Unique Images", images.size));
+  div.appendChild(makeCard("Open", open));
+  div.appendChild(makeCard("Fixed", fixed));
+
+  const sevMap = {
+    "Critical": "sev-critical",
+    "High": "sev-high",
+    "Medium": "sev-medium",
+    "Low": "sev-low"
+  };
+
+  Object.keys(sevMap).forEach(sev => {
+    if (bySeverity[sev]) {
+      div.appendChild(makeCard(sev, bySeverity[sev], sevMap[sev]));
+    }
+  });
+}
+
+function makeCard(title, value, css="") {
+  const d = document.createElement("div");
+  d.className = "card " + css;
+  d.innerHTML = `<strong>${title}</strong><br>${value}`;
+  return d;
+}
+
+/* ---------- Table Rendering ---------- */
+function renderTable() {
+  const tbody = document.querySelector('#resultsTable tbody');
+  tbody.innerHTML = "";
+
+  const sevFilter = document.getElementById('severityFilter').value;
+  const imgFilter = document.getElementById('imageFilter').value.toLowerCase();
+  const fixFilter = document.getElementById('fixFilter').value;
+  const statusFilter = document.getElementById('statusFilter').value;
+
+  currentFiltered = groupedFindings.filter(g => {
+    if (sevFilter && g.severity !== sevFilter) return false;
+    if (imgFilter && !g.images.some(i => i.toLowerCase().includes(imgFilter))) return false;
+
+    const hasFix = !!g.fixVersion;
+    if (fixFilter === "yes" && !hasFix) return false;
+    if (fixFilter === "no" && hasFix) return false;
+
+    const status = fixedStatus[g.key] || "open";
+    if (statusFilter && status !== statusFilter) return false;
+
+    return true;
+  });
+
+  currentFiltered.forEach(g => {
+    const row = document.createElement("tr");
+    const imagesStr = g.images.join(", ");
+    const status = fixedStatus[g.key] || "open";
+    const commentText = comments[g.key] || "";
+
+    row.innerHTML = `
+      <td>${escapeHtml(g.vulnId)}</td>
+      <td>${escapeHtml(g.severity)}</td>
+      <td>${escapeHtml(g.package)}</td>
+      <td>${escapeHtml(g.installedVersion)}</td>
+      <td>${escapeHtml(g.fixVersion)}</td>
+      <td>${escapeHtml(g.type)}</td>
+      <td title="${escapeHtml(imagesStr)}">${g.images.length}</td>
+      <td title="${escapeHtml(imagesStr)}">${escapeHtml(imagesStr)}</td>
+      <td>
+        <label>
+          <input type="checkbox" class="status-checkbox" data-key="${escapeHtml(g.key)}" ${status === "fixed" ? "checked" : ""}>
+          <span>${status}</span>
+        </label>
+      </td>
+      <td>
+        <textarea class="comment-box" data-key="${escapeHtml(g.key)}">${escapeHtml(commentText)}</textarea>
+      </td>
+    `;
+
+    tbody.appendChild(row);
+  });
+}
+
+function escapeHtml(s) {
+  return String(s || "")
+    .replace(/&/g,"&amp;")
+    .replace(/</g,"&lt;")
+    .replace(/>/g,"&gt;");
+}
+
+/* ---------- CSV Export ---------- */
+function csvEscape(v) {
+  v = String(v ?? "");
+  return `"${v.replace(/"/g,'""')}"`;
+}
+
+function exportToCsv() {
+  if (!currentFiltered.length) {
+    alert("No rows to export.");
+    return;
+  }
+
+  const lines = [];
+  lines.push([
+    "Vuln ID","Severity","Package","Installed Version",
+    "Fix Version","Type","Images Count","Images","Status","Comments"
+  ].map(csvEscape).join(","));
+
+  currentFiltered.forEach(g => {
+    const row = [
+      g.vulnId,
+      g.severity,
+      g.package,
+      g.installedVersion,
+      g.fixVersion,
+      g.type,
+      g.images.length,
+      g.images.join("; "),
+      fixedStatus[g.key] || "open",
+      comments[g.key] || ""
+    ];
+    lines.push(row.map(csvEscape).join(","));
+  });
+
+  const blob = new Blob([lines.join("\r\n")], {type:"text/csv;charset=utf-8;"});
+  const url = URL.createObjectURL(blob);
+
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = "grype-report.csv";
+  a.click();
+  URL.revokeObjectURL(url);
+}
+
+document.getElementById("exportBtn").addEventListener("click", exportToCsv);
+
+/* ---------- Export/Import Status & Comments ---------- */
+function exportStatusToFile() {
+  const data = {
+    fixedStatus,
+    comments
+  };
+  const blob = new Blob([JSON.stringify(data,null,2)], {type:"application/json"});
+  const url = URL.createObjectURL(blob);
+
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = "grype-status.json";
+  a.click();
+  URL.revokeObjectURL(url);
+}
+document.getElementById("exportStatusBtn").addEventListener("click", exportStatusToFile);
+
+function importStatusFromFile(file) {
+  const reader = new FileReader();
+  reader.onload = evt => {
+    try {
+      const data = JSON.parse(evt.target.result);
+      fixedStatus = { ...(fixedStatus || {}), ...(data.fixedStatus || {}) };
+      comments = { ...(comments || {}), ...(data.comments || {}) };
+
+      saveFixedStatus();
+      saveComments();
+
+      renderSummary();
+      renderTable();
+
+      alert("Status + Comments imported.");
+    } catch {
+      alert("Invalid JSON file.");
+    }
+  };
+  reader.readAsText(file);
+}
+document.getElementById("importStatusInput").addEventListener("change", e => {
+  const f = e.target.files?.[0];
+  if (f) importStatusFromFile(f);
+  e.target.value = "";
+});
+
+/* ---------- Status & Comment Event Listeners ---------- */
+document.querySelector('#resultsTable tbody').addEventListener('change', e => {
+  if (e.target.classList.contains('status-checkbox')) {
+    const key = e.target.dataset.key;
+    fixedStatus[key] = e.target.checked ? "fixed" : "open";
+    saveFixedStatus();
+    e.target.nextElementSibling.textContent = fixedStatus[key];
+    renderSummary();
+    renderTable();
+  }
+
+  if (e.target.classList.contains('comment-box')) {
+    const key = e.target.dataset.key;
+    comments[key] = e.target.value;
+    saveComments();
+  }
+});
+</script>
+
+</body>
+</html>
